@@ -1,0 +1,391 @@
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+    <title>Image to Image Style Transfer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css" rel="stylesheet"/>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;700&display=swap" rel="stylesheet"/>
+    <style>
+        body {
+            background-color: #000;
+            color: #d1d5db;
+            font-family: 'Poppins', sans-serif;
+        }
+        .file-input {
+            display: none;
+        }
+        .file-label {
+            display: inline-block;
+            background: transparent;
+            border: 2px solid #6b7280;
+            color: #fff;
+            padding: 10px 20px;
+            border-radius: 25px;
+            cursor: pointer;
+            transition: background 0.3s ease, color 0.3s ease, transform 0.3s ease;
+        }
+        .file-label:hover {
+            background: #6b7280;
+            color: white;
+            transform: scale(1.05);
+        }
+        .card {
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid #4b5563;
+            border-radius: 15px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .button-80 {
+            background: transparent;
+            border: 2px solid #6b7280;
+            border-radius: 25px;
+            color: #fff;
+            cursor: pointer;
+            display: inline-block;
+            font-family: 'Poppins', sans-serif;
+            font-size: 1.125rem;
+            font-weight: 700;
+            letter-spacing: -.01em;
+            line-height: 1.3;
+            padding: 10px 20px;
+            position: relative;
+            text-align: center;
+            text-decoration: none;
+            transform: translateZ(0) scale(1);
+            transition: transform .2s, background .2s, color .2s;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: manipulation;
+        }
+        .button-80:not(:disabled):hover {
+            transform: scale(1.05);
+            background: #6b7280;
+            color: white;
+        }
+        .button-80:not(:disabled):hover:active {
+            transform: scale(1.05) translateY(.125rem);
+        }
+        .button-80:focus {
+            outline: 0 solid transparent;
+        }
+        .button-80:focus:before {
+            content: "";
+            left: calc(-1*.375rem);
+            pointer-events: none;
+            position: absolute;
+            top: calc(-1*.375rem);
+            transition: border-radius;
+            user-select: none;
+        }
+        .button-80:focus:not(:focus-visible) {
+            outline: 0 solid transparent;
+        }
+        .button-80:focus:not(:focus-visible):before {
+            border-width: 0;
+        }
+        .button-80:not(:disabled):active {
+            transform: translateY(.125rem);
+        }
+        .placeholder-text {
+            text-align: center;
+            padding: 20px;
+            color: #9ca3af;
+        }
+        /* Style slider styles */
+        .style-slider {
+            -webkit-appearance: none;
+            width: 100%;
+            height: 8px;
+            border-radius: 4px;
+            background: #4b5563;
+            outline: none;
+            margin: 15px 0;
+        }
+        .style-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #6b7280;
+            cursor: pointer;
+            transition: background 0.3s ease;
+        }
+        .style-slider::-webkit-slider-thumb:hover {
+            background: #9ca3af;
+        }
+        .webcam-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        .webcam-container {
+            background: #1f2937;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+</head>
+<body class="font-poppins">
+    <div class="container mx-auto p-4 max-w-4xl">
+        <h1 class="text-3xl font-bold text-center mb-2">Image To Image Style Transfer</h1>
+        <h2 class="text-xl text-center mb-8">Done by Team 4 Group 1</h2>
+        <form enctype="multipart/form-data" id="imageForm">
+            <div class="flex flex-col md:flex-row justify-center items-start mb-8">
+                <!-- Content Image Section -->
+                <div class="w-full md:w-1/2 p-4">
+                    <div class="card rounded-lg shadow-md">
+                        <h2 class="text-xl font-bold mb-4">Content Image</h2>
+                        <label class="block mb-2 font-bold">Upload Content Image</label>
+                        <div class="flex items-center">
+                            <label class="file-label mr-2" for="contentImageInput">Choose File</label>
+                            <button class="file-label" type="button" onclick="openWebcam()">Open Webcam</button>
+                        </div>
+                        <input class="file-input" id="contentImageInput" name="contentImage" onchange="displayImage(event, 'contentImagePlaceholder')" type="file"/>
+                        <div class="mt-4">
+                            <img alt="Content image placeholder" class="rounded-lg shadow-md w-full h-auto" height="200" id="contentImagePlaceholder" src="" width="400" style="display: none;"/>
+                            <div class="placeholder-text" id="contentImagePlaceholderText">Content image will be displayed here.</div>
+                        </div>
+                    </div>
+                </div>
+                <!-- Style Image Section -->
+                <div class="w-full md:w-1/2 p-4">
+                    <div class="card rounded-lg shadow-md">
+                        <h2 class="text-xl font-bold mb-4">Style Image</h2>
+                        <label class="block mb-2 font-bold">Upload Style Image</label>
+                        <label class="file-label" for="styleImageInput">Choose File</label>
+                        <input class="file-input" id="styleImageInput" name="styleImage" onchange="displayImage(event, 'styleImagePlaceholder')" type="file"/>
+                        <div class="mt-4">
+                            <img alt="Style image placeholder" class="rounded-lg shadow-md w-full h-auto" height="200" id="styleImagePlaceholder" src="" width="400" style="display: none;"/>
+                            <div class="placeholder-text" id="styleImagePlaceholderText">Style image will be displayed here.</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- Style Intensity Slider -->
+            <div class="flex justify-center mb-8">
+                <div class="w-full md:w-1/2 p-4">
+                    <div class="card rounded-lg shadow-md">
+                        <h2 class="text-xl font-bold mb-4">Style Intensity</h2>
+                        <input type="range" min="0" max="100" value="100" class="style-slider" id="styleSlider">
+                        <div class="flex justify-between text-sm">
+                            <span>Content</span>
+                            <span id="styleValue">100%</span>
+                            <span>Style</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- Generate Button -->
+            <div class="flex justify-center mb-8">
+                <button class="button-80 flex items-center justify-center" id="generateButton" onclick="generateImage()" type="button">
+                    <span id="generateButtonText">Generate</span>
+                    <i class="fas fa-spinner fa-spin ml-2" id="loadingSpinner" style="display: none;"></i>
+                </button>
+            </div>
+        </form>
+        <!-- Generated Image Display -->
+        <div class="flex justify-center mb-8">
+            <div class="w-full md:w-1/2 p-4">
+                <div class="card rounded-lg shadow-md">
+                    <h2 class="text-xl font-bold mb-4">Generated Image</h2>
+                    <div class="flex justify-center relative">
+                        <img alt="Generated image" class="rounded-lg shadow-md w-full h-auto" height="200" id="generatedImage" src="" width="200" style="display: none;"/>
+                        <div class="placeholder-text" id="generatedImagePlaceholderText">Generated image will be displayed here.</div>
+                        <a class="absolute bottom-2 right-2 bg-gray-500 text-white p-2 rounded-full hover:bg-gray-700" download="generated_image.png" id="downloadLink" style="display: none;">
+                            <i class="fas fa-download"></i>
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        // Style slider functionality
+        const styleSlider = document.getElementById('styleSlider');
+        const styleValue = document.getElementById('styleValue');
+        styleSlider.oninput = function() {
+            styleValue.textContent = this.value + '%';
+        }
+
+        // Function to reset the form and UI elements
+        function resetForm() {
+            // Reset images and placeholders
+            ['contentImagePlaceholder', 'styleImagePlaceholder', 'generatedImage'].forEach(id => {
+                const img = document.getElementById(id);
+                const placeholder = document.getElementById(id + 'Text');
+                img.src = '';
+                img.style.display = 'none';
+                if (placeholder) {
+                    placeholder.style.display = 'block';
+                }
+            });
+
+            // Reset file inputs
+            document.getElementById('contentImageInput').value = '';
+            document.getElementById('styleImageInput').value = '';
+
+            // Reset style slider
+            styleSlider.value = 100;
+            styleValue.textContent = '100%';
+
+            // Hide download link
+            document.getElementById('downloadLink').style.display = 'none';
+        }
+
+        // Display image in placeholder when user uploads an image
+        function displayImage(event, placeholderId) {
+            if (!event.target.files || !event.target.files[0]) return;
+            
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const img = document.getElementById(placeholderId);
+                const placeholder = document.getElementById(placeholderId + 'Text');
+                img.src = e.target.result;
+                img.style.display = 'block';
+                if (placeholder) {
+                    placeholder.style.display = 'none';
+                }
+            };
+            reader.readAsDataURL(event.target.files[0]);
+        }
+
+        // Generate styled image
+        async function generateImage() {
+            const generateButton = document.getElementById('generateButton');
+            const generateButtonText = document.getElementById('generateButtonText');
+            const loadingSpinner = document.getElementById('loadingSpinner');
+            const contentImage = document.getElementById('contentImageInput').files[0];
+            const styleImage = document.getElementById('styleImageInput').files[0];
+            const styleWeight = document.getElementById('styleSlider').value / 100;
+
+            try {
+                // Show loading state
+                generateButton.disabled = true;
+                generateButtonText.textContent = 'Generating...';
+                loadingSpinner.style.display = 'inline-block';
+
+                const formData = new FormData();
+                formData.append('styleWeight', styleWeight);
+
+                // Add content image (from file input or webcam)
+                if (contentImage) {
+                    formData.append('contentImage', contentImage);
+                } else {
+                    const webcamImage = document.getElementById('contentImagePlaceholder').src;
+                    if (webcamImage && webcamImage.startsWith('data:image')) {
+                        formData.append('webcamImage', webcamImage);
+                    } else {
+                        throw new Error('Please provide a content image');
+                    }
+                }
+
+                // Add style image
+                if (!styleImage) {
+                    throw new Error('Please provide a style image');
+                }
+                formData.append('styleImage', styleImage);
+
+                // Send request to server
+                const response = await fetch('/generate', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Failed to generate image');
+                }
+
+                const data = await response.json();
+                
+                // Display generated image
+                const generatedImage = document.getElementById('generatedImage');
+                const generatedPlaceholder = document.getElementById('generatedImagePlaceholderText');
+                const downloadLink = document.getElementById('downloadLink');
+                
+                generatedImage.src = data.image_data;
+                generatedImage.style.display = 'block';
+                generatedPlaceholder.style.display = 'none';
+                
+                // Update download link
+                downloadLink.href = data.image_data;
+                downloadLink.style.display = 'block';
+
+            } catch (error) {
+                alert(error.message || 'An error occurred');
+            } finally {
+                // Reset button state
+                generateButton.disabled = false;
+                generateButtonText.textContent = 'Generate';
+                loadingSpinner.style.display = 'none';
+            }
+        }
+
+        // Webcam functionality
+        let webcamStream = null;
+
+        function openWebcam() {
+            const modal = document.createElement('div');
+            modal.className = 'webcam-modal';
+            modal.innerHTML = `
+                <div class="webcam-container">
+                    <video id="webcam" width="400" height="300" autoplay></video>
+                    <div class="mt-4 flex justify-center space-x-4">
+                        <button class="button-80" onclick="captureImage()">Capture</button>
+                        <button class="button-80" onclick="closeWebcam()">Close</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+
+            navigator.mediaDevices.getUserMedia({ video: true })
+                .then(stream => {
+                    webcamStream = stream;
+                    document.getElementById('webcam').srcObject = stream;
+                })
+                .catch(error => {
+                    alert('Error accessing webcam: ' + error.message);
+                    closeWebcam();
+                });
+        }
+
+        function closeWebcam() {
+            if (webcamStream) {
+                webcamStream.getTracks().forEach(track => track.stop());
+                webcamStream = null;
+            }
+            const modal = document.querySelector('.webcam-modal');
+            if (modal) {
+                modal.remove();
+            }
+        }
+
+        function captureImage() {
+            const video = document.getElementById('webcam');
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+            
+            const img = document.getElementById('contentImagePlaceholder');
+            const placeholder = document.getElementById('contentImagePlaceholderText');
+            img.src = canvas.toDataURL('image/png');
+            img.style.display = 'block';
+            placeholder.style.display = 'none';
+            
+            closeWebcam();
+        }
+    </script>
+</body>
+</html>

@@ -40,7 +40,7 @@ def save_images(visuals, result_dir, image_path, opt):
 
 
 def test_model(opt):
-    """Test the model.
+    """Test the model with performance optimizations.
     
     Args:
         opt: Command line options
@@ -61,12 +61,16 @@ def test_model(opt):
         dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=opt.num_threads
+        num_workers=opt.num_threads,
+        pin_memory=torch.cuda.is_available()
     )
     
     # Create the model
     model = AdaINStyleCycleGAN(opt)
     model.eval()
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() and not hasattr(opt, 'cpu_mode') else 'cpu')
     
     # Load the trained model
     checkpoint_path = os.path.join(opt.checkpoints_dir, opt.name, 'latest_net.pth')
@@ -75,11 +79,16 @@ def test_model(opt):
         return
     
     print(f'Loading the model from {checkpoint_path}')
-    checkpoint = torch.load(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     model.netG_A.load_state_dict(checkpoint['netG_A'])
     model.netG_B.load_state_dict(checkpoint['netG_B'])
     
     # Initialize metric calculators if needed
+    metrics = None
+    fid_calculator = None
+    outputs_for_fid = []
+    refs_for_fid = []
+    
     if opt.compute_metrics:
         metrics = {
             'psnr': [],
@@ -89,92 +98,89 @@ def test_model(opt):
             metrics['fid'] = []
             fid_calculator = FID(opt.gpu_ids[0] if opt.gpu_ids else 'cpu')
     
-    # Testing loop
-    for i, data in enumerate(dataloader):
-        print(f'Processing image {i+1}/{len(dataloader)}')
-        
-        if isinstance(dataset, SingleStyleDataset):
-            # For single image style transfer
-            content = data['content'].to(model.device)
-            style = data['style'].to(model.device) if 'style' in data else None
+    # Testing loop with torch.inference_mode() for faster inference
+    with torch.inference_mode():
+        for i, data in enumerate(dataloader):
+            print(f'Processing image {i+1}/{len(dataloader)}')
             
-            # Extract style features if using AdaIN
-            if style is not None and model.use_adain:
-                style_features = model.style_encoder(style)
+            if isinstance(dataset, SingleStyleDataset):
+                # For single image style transfer
+                content = data['content'].to(model.device)
+                style = data['style'].to(model.device) if 'style' in data else None
                 
-                # Generate stylized output
-                with torch.no_grad():
+                # Extract style features if using AdaIN
+                if style is not None and model.use_adain:
+                    style_features = model.style_encoder(style)
+                    
+                    # Generate stylized output
                     output = model.netG_A(content, style_features)
+                    
+                    # Save the results
+                    visuals = {'content': content, 'style': style, 'output': output}
+                    save_images(visuals, result_dir, data['content_path'][0], opt)
+                    
+                    # Compute metrics if needed
+                    if metrics and opt.reference_dir:
+                        # Load reference image
+                        ref_path = os.path.join(opt.reference_dir, os.path.basename(data['content_path'][0]))
+                        if os.path.exists(ref_path):
+                            ref_img = Image.open(ref_path).convert('RGB')
+                            transform = dataset.transform
+                            ref_tensor = transform(ref_img).unsqueeze(0).to(model.device)
+                            
+                            # Compute metrics
+                            metrics['psnr'].append(calculate_psnr(output, ref_tensor))
+                            metrics['ssim'].append(calculate_ssim(output, ref_tensor))
+                            if 'fid' in metrics:
+                                # Collect outputs for FID calculation
+                                outputs_for_fid.append(output.detach().cpu())
+                                refs_for_fid.append(ref_tensor.detach().cpu())
+            else:
+                # For standard CycleGAN testing
+                model.set_input(data)
+                
+                # Forward pass
+                model.forward()
                 
                 # Save the results
-                visuals = {'content': content, 'style': style, 'output': output}
-                save_images(visuals, result_dir, data['content_path'][0], opt)
+                visuals = {
+                    'real_A': model.real_A,
+                    'fake_B': model.fake_B,
+                    'rec_A': model.rec_A,
+                    'real_B': model.real_B,
+                    'fake_A': model.fake_A,
+                    'rec_B': model.rec_B
+                }
+                
+                if hasattr(data, 'A_paths'):
+                    img_path = data['A_paths'][0]
+                elif hasattr(data, 'path'):
+                    img_path = data['path'][0]
+                else:
+                    img_path = f'test_image_{i}.png'
+                
+                save_images(visuals, result_dir, img_path, opt)
                 
                 # Compute metrics if needed
-                if opt.compute_metrics and opt.reference_dir:
-                    # Load reference image
-                    ref_path = os.path.join(opt.reference_dir, os.path.basename(data['content_path'][0]))
-                    if os.path.exists(ref_path):
-                        ref_img = Image.open(ref_path).convert('RGB')
-                        transform = dataset.transform
-                        ref_tensor = transform(ref_img).unsqueeze(0).to(model.device)
-                        
-                        # Compute metrics
-                        metrics['psnr'].append(calculate_psnr(output, ref_tensor))
-                        metrics['ssim'].append(calculate_ssim(output, ref_tensor))
-                        if 'fid' in metrics:
-                            # FID requires multiple images, so we collect them and compute later
-                            if not hasattr(test_model, 'outputs'):
-                                test_model.outputs = []
-                                test_model.refs = []
-                            test_model.outputs.append(output)
-                            test_model.refs.append(ref_tensor)
-        else:
-            # For standard CycleGAN testing
-            model.set_input(data)
-            
-            # Forward pass
-            with torch.no_grad():
-                model.forward()
-            
-            # Save the results
-            visuals = {
-                'real_A': model.real_A,
-                'fake_B': model.fake_B,
-                'rec_A': model.rec_A,
-                'real_B': model.real_B,
-                'fake_A': model.fake_A,
-                'rec_B': model.rec_B
-            }
-            
-            if hasattr(data, 'A_paths'):
-                img_path = data['A_paths'][0]
-            elif hasattr(data, 'path'):
-                img_path = data['path'][0]
-            else:
-                img_path = f'test_image_{i}.png'
-            
-            save_images(visuals, result_dir, img_path, opt)
-            
-            # Compute metrics if needed
-            if opt.compute_metrics:
-                metrics['psnr'].append(calculate_psnr(model.rec_A, model.real_A))
-                metrics['ssim'].append(calculate_ssim(model.rec_A, model.real_A))
-                metrics['psnr'].append(calculate_psnr(model.rec_B, model.real_B))
-                metrics['ssim'].append(calculate_ssim(model.rec_B, model.real_B))
+                if metrics:
+                    metrics['psnr'].append(calculate_psnr(model.rec_A, model.real_A))
+                    metrics['ssim'].append(calculate_ssim(model.rec_A, model.real_A))
+                    metrics['psnr'].append(calculate_psnr(model.rec_B, model.real_B))
+                    metrics['ssim'].append(calculate_ssim(model.rec_B, model.real_B))
     
     # Compute FID if collected
-    if opt.compute_metrics and 'fid' in metrics and hasattr(test_model, 'outputs') and len(test_model.outputs) > 0:
-        outputs = torch.cat(test_model.outputs, dim=0)
-        refs = torch.cat(test_model.refs, dim=0)
+    if metrics and 'fid' in metrics and len(outputs_for_fid) > 0:
+        outputs = torch.cat(outputs_for_fid, dim=0)
+        refs = torch.cat(refs_for_fid, dim=0)
         metrics['fid'] = fid_calculator.calculate_fid(refs, outputs)
     
     # Print metrics results
-    if opt.compute_metrics:
+    if metrics:
         print('===== Metrics Results =====')
         for metric_name, values in metrics.items():
             if metric_name != 'fid':
-                print(f'Average {metric_name.upper()}: {np.mean(values):.4f}')
+                if isinstance(values, list) and len(values) > 0:
+                    print(f'Average {metric_name.upper()}: {np.mean(values):.4f}')
             else:
                 print(f'FID: {values:.4f}')
         
@@ -182,7 +188,8 @@ def test_model(opt):
         with open(os.path.join(result_dir, 'metrics.txt'), 'w') as f:
             for metric_name, values in metrics.items():
                 if metric_name != 'fid':
-                    f.write(f'Average {metric_name.upper()}: {np.mean(values):.4f}\n')
+                    if isinstance(values, list) and len(values) > 0:
+                        f.write(f'Average {metric_name.upper()}: {np.mean(values):.4f}\n')
                 else:
                     f.write(f'FID: {values:.4f}\n')
 
@@ -192,9 +199,13 @@ def main():
     # Parse command-line options
     opt = TestOptions().parse()
     
+    # Enable cuDNN benchmarking for faster inference
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+    
     # Test the model
     test_model(opt)
 
 
 if __name__ == '__main__':
-    main() 
+    main()

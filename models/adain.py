@@ -23,41 +23,59 @@ class AdaIN(nn.Module):
         super(AdaIN, self).__init__()
         self.epsilon = epsilon
         
-    def forward(self, content_feat, style_feat):
+    def forward(self, content_feat, style_feat, alpha=1.0):
         """Forward pass of AdaIN.
         
         Args:
             content_feat (torch.Tensor): Content feature tensor of shape (B, C, H, W)
-            style_feat (torch.Tensor): Style feature tensor of shape (B, N, C', H', W')
-                                      where N is number of style images per batch
+            style_feat (torch.Tensor): Style feature tensor of shape (B, C, H', W')
+                                      or (B, N, C, H', W') where N is the number of
+                                      style images per batch element. Channel count
+                                      must match the content features.
+            alpha (float): Style interpolation weight applied in feature space.
+                           1.0 applies the full style statistics, 0.0 returns the
+                           content features unchanged, values > 1.0 extrapolate.
         
         Returns:
             torch.Tensor: The normalized and modulated content feature tensor.
         """
-        # Handle multiple style images per batch
-        if len(style_feat.shape) == 5:  # [B, N, C, H, W]
+        multi_style = style_feat.dim() == 5
+        if multi_style:  # [B, N, C, H, W]
             B, N, C, H, W = style_feat.shape
-            style_feat = style_feat.view(-1, C, H, W)  # [B*N, C, H, W]
+            style_feat = style_feat.view(B * N, C, H, W)
         
-        # Ensure feature dimensions match
-        if content_feat.size(1) != style_feat.size(1):
-            # Add 1x1 convolution to match feature dimensions
-            conv = nn.Conv2d(style_feat.size(1), content_feat.size(1), kernel_size=1).to(style_feat.device)
-            style_feat = conv(style_feat)
+        assert content_feat.size(1) == style_feat.size(1), (
+            f'Channel mismatch between content ({content_feat.size(1)}) and '
+            f'style ({style_feat.size(1)}) features. Project style features '
+            f'before applying AdaIN.'
+        )
         
         batch_size, channel_size = content_feat.size(0), content_feat.size(1)
         
         # Calculate content features statistics (mean and std)
-        content_mean = content_feat.view(batch_size, channel_size, -1).mean(dim=2).view(batch_size, channel_size, 1, 1)
-        content_std = content_feat.view(batch_size, channel_size, -1).std(dim=2).view(batch_size, channel_size, 1, 1) + self.epsilon
+        content_view = content_feat.view(batch_size, channel_size, -1)
+        content_mean = content_view.mean(dim=2).view(batch_size, channel_size, 1, 1)
+        content_std = content_view.std(dim=2).view(batch_size, channel_size, 1, 1) + self.epsilon
         content_feat_normalized = (content_feat - content_mean) / content_std
         
-        # Calculate style features statistics
-        style_mean = style_feat.view(batch_size, channel_size, -1).mean(dim=2).view(batch_size, channel_size, 1, 1)
-        style_std = style_feat.view(batch_size, channel_size, -1).std(dim=2).view(batch_size, channel_size, 1, 1) + self.epsilon
+        # Calculate style statistics per style image, then average the statistics
+        # over the N exemplars of each batch element so they align with the
+        # content batch dimension.
+        style_view = style_feat.view(style_feat.size(0), channel_size, -1)
+        style_mean = style_view.mean(dim=2)
+        style_std = style_view.std(dim=2)
+        if multi_style:
+            style_mean = style_mean.view(B, N, channel_size).mean(dim=1)
+            style_std = style_std.view(B, N, channel_size).mean(dim=1)
+        style_mean = style_mean.view(-1, channel_size, 1, 1)
+        style_std = style_std.view(-1, channel_size, 1, 1) + self.epsilon
         
         # Adapt content features to style features
         adapted_features = style_std * content_feat_normalized + style_mean
+        
+        # Feature-space interpolation between content and stylized features
+        if alpha != 1.0:
+            adapted_features = content_feat + alpha * (adapted_features - content_feat)
         
         return adapted_features
 
@@ -102,15 +120,16 @@ class StyleEncoder(nn.Module):
             torch.Tensor: Style features.
         """
         # Reshape input to handle multiple style images per batch
-        if len(x.shape) == 5:  # [B, N, C, H, W]
+        multi_style = x.dim() == 5
+        if multi_style:  # [B, N, C, H, W]
             B, N, C, H, W = x.shape
-            x = x.view(-1, C, H, W)  # [B*N, C, H, W]
+            x = x.view(B * N, C, H, W)
         
         # Extract features
         features = self.encoder(x)
         
         # Reshape back if we had multiple style images
-        if len(x.shape) == 4 and x.shape[0] == B * N:
+        if multi_style:
             features = features.view(B, N, *features.shape[1:])
         
         return features
@@ -123,7 +142,8 @@ class AdaINResBlock(nn.Module):
     enable arbitrary style transfer in CycleGAN generator networks.
     """
     
-    def __init__(self, dim, use_adain=True, padding_type='reflect', norm_layer=nn.InstanceNorm2d):
+    def __init__(self, dim, use_adain=True, padding_type='reflect', norm_layer=nn.InstanceNorm2d,
+                 style_nc=128):
         """Initialize AdaIN Residual Block.
         
         Args:
@@ -131,12 +151,26 @@ class AdaINResBlock(nn.Module):
             use_adain (bool): Whether to use AdaIN layers.
             padding_type (str): Type of padding ('reflect', 'replicate', 'zero').
             norm_layer: Normalization layer.
+            style_nc (int): Number of channels of the incoming style features
+                            (128 for the VGG19-based StyleEncoder).
         """
         super(AdaINResBlock, self).__init__()
         self.use_adain = use_adain
         self.conv_block = self._build_conv_block(dim, padding_type, norm_layer)
         self.adain1 = AdaIN() if use_adain else None
         self.adain2 = AdaIN() if use_adain else None
+        # Learned projection that maps style features to this block's channel
+        # count. Registered here so it is trained with the generator (instead
+        # of being recreated with random weights on every forward pass).
+        self.style_proj = nn.Conv2d(style_nc, dim, kernel_size=1) if use_adain else None
+    
+    def _project_style(self, style_feat):
+        """Project style features to this block's channel count."""
+        if style_feat.dim() == 5:  # [B, N, C, H, W]
+            B, N = style_feat.shape[:2]
+            projected = self.style_proj(style_feat.flatten(0, 1))
+            return projected.view(B, N, *projected.shape[1:])
+        return self.style_proj(style_feat)
     
     def _build_conv_block(self, dim, padding_type, norm_layer):
         """Build the convolutional block.
@@ -183,13 +217,14 @@ class AdaINResBlock(nn.Module):
         
         return nn.Sequential(*conv_block)
     
-    def forward(self, x, style_feat=None):
+    def forward(self, x, style_feat=None, alpha=1.0):
         """Forward pass of AdaIN residual block.
         
         Args:
             x (torch.Tensor): Input feature tensor.
             style_feat (torch.Tensor, optional): Style feature tensor.
                                               Required if use_adain is True.
+            alpha (float): Feature-space style interpolation weight.
         
         Returns:
             torch.Tensor: Output feature tensor with style transfer applied.
@@ -197,14 +232,17 @@ class AdaINResBlock(nn.Module):
         if self.use_adain:
             assert style_feat is not None, "Style features must be provided when use_adain is True"
             
+            style_feat = self._project_style(style_feat)
+            
             # Apply first convolution and AdaIN
             out = self.conv_block[0:3](x)  # Padding, Conv, Identity
-            out = self.adain1(out, style_feat)
-            out = F.relu(out, True)
+            out = self.adain1(out, style_feat, alpha)
+            out = F.relu(out)
             
-            # Apply second convolution and AdaIN
-            out = self.conv_block[3:6](out)  # Padding, Conv, Identity
-            out = self.adain2(out, style_feat)
+            # Apply second convolution and AdaIN (index 3 is the ReLU module,
+            # already applied above, so skip it)
+            out = self.conv_block[4:7](out)  # Padding, Conv, Identity
+            out = self.adain2(out, style_feat, alpha)
         else:
             out = self.conv_block(x)
         

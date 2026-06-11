@@ -72,13 +72,15 @@ class AdaINGenerator(nn.Module):
         # Store the model after ResNet blocks
         self.model_up = nn.Sequential(*model)
     
-    def forward(self, x, style_feat=None):
+    def forward(self, x, style_feat=None, alpha=1.0):
         """Forward pass of the generator.
         
         Args:
             x (torch.Tensor): Input image tensor
             style_feat (torch.Tensor, optional): Style feature tensor
                                               Required if use_adain is True
+            alpha (float): Feature-space style interpolation weight
+                           (0.0 = content only, 1.0 = full style).
         
         Returns:
             torch.Tensor: Output image tensor
@@ -87,10 +89,34 @@ class AdaINGenerator(nn.Module):
         
         # Apply AdaIN ResNet blocks
         for res_block in self.res_blocks:
-            x = res_block(x, style_feat) if self.use_adain else res_block(x)
+            x = res_block(x, style_feat, alpha) if self.use_adain else res_block(x)
         
         x = self.model_up(x)
         return x
+
+
+class GANLoss(nn.Module):
+    """LSGAN objective that builds target tensors matching the prediction shape."""
+    
+    def __init__(self):
+        super(GANLoss, self).__init__()
+        self.loss = nn.MSELoss()
+    
+    def forward(self, prediction, target_is_real):
+        """Compute the LSGAN loss.
+        
+        Args:
+            prediction (torch.Tensor): Discriminator output.
+            target_is_real (bool): Whether the target label is real or fake.
+        
+        Returns:
+            torch.Tensor: Loss value.
+        """
+        if target_is_real:
+            target = torch.ones_like(prediction)
+        else:
+            target = torch.zeros_like(prediction)
+        return self.loss(prediction, target)
 
 
 class Discriminator(nn.Module):
@@ -205,6 +231,11 @@ class AdaINStyleCycleGAN(nn.Module):
         if self.use_adain:
             self.style_encoder = StyleEncoder()
         
+        # Loss criteria
+        self.criterionGAN = GANLoss()
+        self.criterionCycle = nn.L1Loss()
+        self.criterionIdt = nn.L1Loss()
+        
         # Move networks to the specified device
         self.netG_A.to(self.device)
         self.netG_B.to(self.device)
@@ -245,18 +276,27 @@ class AdaINStyleCycleGAN(nn.Module):
             self.style_img = input_data['style'].to(self.device)
     
     def forward(self):
-        """Forward pass to compute the generated images."""
+        """Forward pass to compute the generated images.
+        
+        With AdaIN enabled, cycle consistency is made well-defined by
+        conditioning each reverse mapping on the style statistics of the
+        original source image: A -> B is stylized with the style exemplar,
+        and B -> A reconstructs A using A's own style features. Without this,
+        the cycle target would be ambiguous for arbitrary styles.
+        """
         if self.use_adain and hasattr(self, 'style_img'):
-            # Extract style features
+            # Extract style features from the exemplar and from both sources
             self.style_features = self.style_encoder(self.style_img)
+            self.style_A = self.style_encoder(self.real_A)
+            self.style_B = self.style_encoder(self.real_B)
             
             # Generate fake images with style transfer
             self.fake_B = self.netG_A(self.real_A, self.style_features)
-            self.fake_A = self.netG_B(self.real_B, self.style_features)
+            self.fake_A = self.netG_B(self.real_B, self.style_A)
             
-            # Reconstruct original images
-            self.rec_A = self.netG_B(self.fake_B, self.style_features)
-            self.rec_B = self.netG_A(self.fake_A, self.style_features)
+            # Reconstruct original images using the source images' own styles
+            self.rec_A = self.netG_B(self.fake_B, self.style_A)
+            self.rec_B = self.netG_A(self.fake_A, self.style_B)
         else:
             # Standard CycleGAN forward pass without style transfer
             self.fake_B = self.netG_A(self.real_A)
@@ -276,12 +316,10 @@ class AdaINStyleCycleGAN(nn.Module):
             torch.Tensor: Discriminator loss
         """
         # Real
-        pred_real = netD(real)
-        loss_D_real = F.mse_loss(pred_real, torch.ones_like(pred_real))
+        loss_D_real = self.criterionGAN(netD(real), True)
         
         # Fake
-        pred_fake = netD(fake.detach())
-        loss_D_fake = F.mse_loss(pred_fake, torch.zeros_like(pred_fake))
+        loss_D_fake = self.criterionGAN(netD(fake.detach()), False)
         
         # Combined loss
         loss_D = (loss_D_real + loss_D_fake) * 0.5
@@ -296,100 +334,110 @@ class AdaINStyleCycleGAN(nn.Module):
         """Calculate GAN loss for discriminator D_B."""
         self.loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, self.fake_A)
     
+    @staticmethod
+    def _feature_stats(feat):
+        """Compute per-channel mean and std of feature maps.
+        
+        Args:
+            feat (torch.Tensor): Features of shape (B, C, H, W) or (B, N, C, H, W).
+                                 For 5D inputs, statistics are averaged over N.
+        
+        Returns:
+            tuple: (mean, std) tensors of shape (B, C)
+        """
+        if feat.dim() == 5:
+            B, N, C = feat.shape[:3]
+            flat = feat.view(B * N, C, -1)
+            mean = flat.mean(dim=2).view(B, N, C).mean(dim=1)
+            std = flat.std(dim=2).view(B, N, C).mean(dim=1)
+        else:
+            flat = feat.view(feat.size(0), feat.size(1), -1)
+            mean = flat.mean(dim=2)
+            std = flat.std(dim=2)
+        return mean, std
+    
+    def criterionStyle(self, generated, style_features):
+        """AdaIN-style loss: match mean/std of VGG features of the generated
+        image to those of the style exemplar.
+        
+        Args:
+            generated (torch.Tensor): Generated images of shape (B, C, H, W)
+            style_features (torch.Tensor): Pre-computed style features
+        
+        Returns:
+            torch.Tensor: Style loss value
+        """
+        gen_mean, gen_std = self._feature_stats(self.style_encoder(generated))
+        style_mean, style_std = self._feature_stats(style_features.detach())
+        return F.mse_loss(gen_mean, style_mean) + F.mse_loss(gen_std, style_std)
+    
     def backward_G(self):
         """Calculate the loss for generators G_A and G_B."""
         lambda_A = self.opt.lambda_A
         lambda_B = self.opt.lambda_B
         lambda_identity = self.opt.lambda_identity
         lambda_style = self.opt.lambda_style if hasattr(self.opt, 'lambda_style') else 0
+        use_style = self.use_adain and hasattr(self, 'style_img')
+        
+        # Identity loss: feeding a target-domain image to a generator should
+        # leave it (approximately) unchanged
+        if lambda_identity > 0:
+            if use_style:
+                self.idt_A = self.netG_A(self.real_B, self.style_B)
+                self.idt_B = self.netG_B(self.real_A, self.style_A)
+            else:
+                self.idt_A = self.netG_A(self.real_B)
+                self.idt_B = self.netG_B(self.real_A)
+            self.loss_idt_A = self.criterionIdt(self.idt_A, self.real_B) * lambda_B * lambda_identity
+            self.loss_idt_B = self.criterionIdt(self.idt_B, self.real_A) * lambda_A * lambda_identity
+        else:
+            self.loss_idt_A = 0
+            self.loss_idt_B = 0
         
         # GAN loss D_A(G_A(A))
-        self.loss_G_A = F.mse_loss(self.netD_A(self.fake_B), torch.ones_like(self.netD_A(self.fake_B)))
+        self.loss_G_A = self.criterionGAN(self.netD_A(self.fake_B), True)
         
         # GAN loss D_B(G_B(B))
-        self.loss_G_B = F.mse_loss(self.netD_B(self.fake_A), torch.ones_like(self.netD_B(self.fake_A)))
-        
-        # Forward cycle loss
-        self.loss_cycle_A = lambda_A * F.l1_loss(self.rec_A, self.real_A)
-        
-        # Backward cycle loss
-        self.loss_cycle_B = lambda_B * F.l1_loss(self.rec_B, self.real_B)
-        
-        # Style loss (if using AdaIN)
-        self.loss_style = 0
-        if self.use_adain and lambda_style > 0 and hasattr(self, 'style_img'):
-            # Extract features from fake_B and style image
-            fake_B_features = self.style_encoder(self.fake_B)
-            style_features = self.style_features.detach()  # Don't backprop through style features
-            
-            # Calculate mean and std for style loss
-            fake_mean = fake_B_features.view(fake_B_features.size(0), fake_B_features.size(1), -1).mean(dim=2)
-            fake_std = fake_B_features.view(fake_B_features.size(0), fake_B_features.size(1), -1).std(dim=2)
-            style_mean = style_features.view(style_features.size(0), style_features.size(1), -1).mean(dim=2)
-            style_std = style_features.view(style_features.size(0), style_features.size(1), -1).std(dim=2)
-            
-            # Mean and std loss
-            self.loss_style = lambda_style * (F.mse_loss(fake_mean, style_mean) + F.mse_loss(fake_std, style_std))
-        
-        # Combined loss
-        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_style
-        self.loss_G.backward()
-    
-    def optimize_parameters(self):
-        """Optimize network parameters."""
-        # Forward pass
-        self.forward()
-        
-        # Set G_A and G_B's gradients to zero
-        self.optimizer_G.zero_grad()
-        
-        # Calculate GAN and cycle losses
-        self.loss_G_A = self.criterionGAN(self.netD_A(self.fake_B), True)
         self.loss_G_B = self.criterionGAN(self.netD_B(self.fake_A), True)
         
         # Forward cycle loss
-        self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * self.opt.lambda_A
-        self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * self.opt.lambda_B
+        self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * lambda_A
         
-        # Style loss if using AdaIN
-        if self.use_adain:
-            self.loss_style = self.criterionStyle(self.fake_B, self.style_features) * self.opt.lambda_style
-        else:
-            self.loss_style = 0
+        # Backward cycle loss
+        self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
         
-        # Combined generator loss
-        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_style
+        # Style loss (if using AdaIN)
+        self.loss_style = 0
+        if use_style and lambda_style > 0:
+            self.loss_style = self.criterionStyle(self.fake_B, self.style_features) * lambda_style
         
-        # Backward pass
+        # Combined loss
+        self.loss_G = (self.loss_G_A + self.loss_G_B
+                       + self.loss_cycle_A + self.loss_cycle_B
+                       + self.loss_idt_A + self.loss_idt_B
+                       + self.loss_style)
         self.loss_G.backward()
+    
+    def optimize_parameters(self):
+        """Optimize network parameters: one generator step, one discriminator step."""
+        # Forward pass
+        self.forward()
         
-        # Clip gradients for stability
+        # Update generators (discriminators frozen)
+        self.set_requires_grad([self.netD_A, self.netD_B], False)
+        self.optimizer_G.zero_grad()
+        self.backward_G()
         torch.nn.utils.clip_grad_norm_(self.netG_A.parameters(), max_norm=1.0)
         torch.nn.utils.clip_grad_norm_(self.netG_B.parameters(), max_norm=1.0)
-        
-        # Update generator parameters
         self.optimizer_G.step()
         
-        # Set D_A and D_B's gradients to zero
+        # Update discriminators
+        self.set_requires_grad([self.netD_A, self.netD_B], True)
         self.optimizer_D.zero_grad()
-        
-        # Calculate discriminator losses
-        self.loss_D_A = self.criterionGAN(self.netD_A(self.real_B), True) + \
-                       self.criterionGAN(self.netD_A(self.fake_B.detach()), False)
-        self.loss_D_B = self.criterionGAN(self.netD_B(self.real_A), True) + \
-                       self.criterionGAN(self.netD_B(self.fake_A.detach()), False)
-        
-        # Combined discriminator loss
-        self.loss_D = (self.loss_D_A + self.loss_D_B) * 0.5
-        
-        # Backward pass
-        self.loss_D.backward()
-        
-        # Clip gradients for stability
+        self.backward_D_A()
+        self.backward_D_B()
         torch.nn.utils.clip_grad_norm_(self.netD_A.parameters(), max_norm=1.0)
         torch.nn.utils.clip_grad_norm_(self.netD_B.parameters(), max_norm=1.0)
-        
-        # Update discriminator parameters
         self.optimizer_D.step()
     
     def set_requires_grad(self, nets, requires_grad=False):

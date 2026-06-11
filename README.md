@@ -1,301 +1,179 @@
-# 🎨 Adaptive Style Transfer in CycleGAN with AdaIN Integration
+# Adaptive Style Transfer in CycleGAN with AdaIN Integration
 
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.9+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A cutting-edge implementation that combines **CycleGAN's** unpaired image translation with **Adaptive Instance Normalization (AdaIN)** for flexible, user-defined style transfer without retraining.
+A PyTorch implementation that combines **CycleGAN's** unpaired image-to-image translation with **Adaptive Instance Normalization (AdaIN)**: a translator to a target domain whose exact appearance is steered per-image by a style exemplar, with adversarial realism and well-defined cycle consistency.
 
-## ✨ Key Features
+## How It Works
 
-- **🎭 Arbitrary Style Transfer**: Apply any style to any content image without model retraining
-- **📸 Content Preservation**: Maintains structural integrity while transferring style
-- **🎨 User-Defined Stylization**: Define custom styles on-the-fly
-- **🌐 Interactive Web Interface**: Easy-to-use Flask web application for non-technical users
-- **📊 Improved Metrics**: Better PSNR, SSIM, and FID scores compared to standard CycleGAN
-- **⚡ Real-time Processing**: Optimized inference with controllable style weight
-- **🎛️ Style Weight Control**: Adjustable influence of style on output images
-
-## 🏗️ Architecture Overview
-
-This project integrates AdaIN layers into CycleGAN's architecture to enable:
-
-1. **Dynamic Style Adaptation**: Content features are dynamically aligned with style statistics
-2. **Cycle Consistency**: Maintains content integrity through bidirectional translation
-3. **Adversarial Training**: Ensures realistic output images
-4. **Flexible Inference**: Apply any style without retraining
-
-### Core Components
+The generator is a ResNet-style CycleGAN generator whose residual blocks replace instance normalization with **AdaIN**:
 
 ```
-AdaIN-CycleGAN = CycleGAN + AdaIN Integration
-│
-├─ Two Generators (A→B, B→A)
-├─ Two Discriminators
-├─ Style Encoder (VGG19-based)
-└─ AdaIN Layers (for style modulation)
+AdaIN(c, s) = σ(s) · (c − μ(c)) / (σ(c) + ε) + μ(s)
 ```
 
-## 📁 Project Structure
+Style statistics come from a frozen **VGG19 encoder** (through `conv2_2`) applied to the style exemplar; each residual block maps them to its own channel count with a learned 1×1 projection.
+
+Two design points distinguish this from a naive CycleGAN+AdaIN mashup:
+
+1. **Well-defined cycle consistency.** The forward mapping stylizes with the exemplar, but each reverse mapping is conditioned on the *source image's own* style statistics — so the reconstruction target is unambiguous even though the forward style is arbitrary:
+
+   ```
+   fake_B = G_A(real_A, style_exemplar)      rec_A = G_B(fake_B, style(real_A))
+   fake_A = G_B(real_B, style(real_A))       rec_B = G_A(fake_A, style(real_B))
+   ```
+
+2. **Feature-space style weight.** The style-strength control α is applied inside the AdaIN layers — `c + α·(AdaIN(c,s) − c)` — not as a pixel-space blend of output images. `α = 0` keeps the content untouched, `α = 1` applies the full style, `α > 1` extrapolates.
+
+### Losses
+
+| Loss | Definition | Default weight |
+|---|---|---|
+| Adversarial | LSGAN (MSE against real/fake targets) | 1 |
+| Cycle consistency | L1 between reconstructions and sources | `λ_A = λ_B = 10` |
+| Identity | L1 when a generator receives its own target domain | `λ_idt = 0.5` |
+| Style | MSE of VGG feature mean/std vs. the exemplar | `λ_style = 1` |
+
+## Project Structure
 
 ```
 .
-├── config/                      # Configuration and hyperparameters
-│   ├── base_options.py         # Base configuration
-│   └── train_options.py        # Training-specific options
-├── data/                        # Data handling
-│   ├── datasets.py             # Dataset implementations
-│   └── download_data.py        # Dataset download utilities
-├── models/                      # Model implementations
-│   ├── adain.py                # AdaIN layer implementation
-│   └── adain_cycle_gan.py      # Main model architecture
-├── utils/                       # Utility functions
-│   ├── image_pool.py           # Image buffer for training
-│   └── metrics.py              # PSNR, SSIM, FID metrics
-├── templates/                   # HTML templates for web interface
-├── static/                      # CSS, JavaScript assets
-├── checkpoints/                 # Saved model checkpoints
-├── datasets/                    # Training and test datasets
-├── docs/                        # Comprehensive documentation
-│   ├── overview.md             # Project overview
-│   ├── architecture.md         # Architecture details
-│   ├── technical_details.md    # Implementation details
-│   ├── workflow.md             # System workflow
-│   └── usage_guide.md          # Detailed usage instructions
-├── app.py                       # Flask web application
-├── train.py                     # Training script
-├── test.py                      # Testing and evaluation
-├── demo.py                      # Command-line demo
-├── CycleGan.md                  # Technical documentation
-└── requirements.txt             # Python dependencies
+├── models/
+│   ├── adain.py                # AdaIN layer, VGG19 StyleEncoder, AdaIN residual block
+│   └── adain_cycle_gan.py      # Generators, PatchGAN discriminators, full training model
+├── config/                      # argparse options (base / train / test)
+├── data/
+│   ├── datasets.py             # Unpaired A/B + style-exemplar datasets
+│   └── download_data.py        # Dataset download helper
+├── utils/
+│   ├── image_pool.py           # Image buffer
+│   └── metrics.py              # PSNR, SSIM, FID (LPIPS-feature based)
+├── datasets/Project_dataset/    # Bundled dataset (trainA/B, testA/B, style/)
+├── examples/                    # Sample content/ and styles/ images for the demo
+├── templates/                   # Web UI (Flask)
+├── document/                    # Full documentation (research, architecture, process, fixes)
+├── Research/                    # Reference papers (CycleGAN, AdaIN, domain transfer)
+├── train.py                     # Training
+├── test.py                      # Evaluation (PSNR / SSIM / FID)
+├── demo.py                      # CLI inference
+├── app.py                       # Flask web app
+└── requirements.txt
 ```
 
-## 🚀 Quick Start
-
-### Prerequisites
-
-- **Python 3.8+**
-- **CUDA-compatible GPU** (recommended for training)
-- **GPU Memory**: 4GB+ for training, 2GB+ for inference
-
-### Installation
-
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/rajeshkadiyalaaa/Adaptive-Style-Transfer-in-CycleGAN-with-AdaIN-Integration.git
-   cd Adaptive-Style-Transfer-in-CycleGAN-with-AdaIN-Integration
-   ```
-
-2. **Create a virtual environment** (recommended):
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Download datasets** (optional):
-   ```bash
-   python data/download_data.py --dataset monet2photo --download_styles
-   ```
-
-## 💻 Usage
-
-### 🌐 Web Interface (Recommended for Beginners)
-
-The easiest way to use style transfer:
+## Installation
 
 ```bash
-python app.py
+git clone https://github.com/rajeshkadiyalaaa/Adaptive-Style-Transfer-in-CycleGAN-with-AdaIN-Integration.git
+cd Adaptive-Style-Transfer-in-CycleGAN-with-AdaIN-Integration
+
+python -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-Then open your browser to `http://localhost:5000` and:
-1. Upload a content image or capture one with your webcam
-2. Upload a style reference image
-3. Adjust the style weight slider (0-2.0)
-4. Click "Generate" to create your styled image
+Pure PyTorch stack — no TensorFlow. CUDA is used automatically when available; CPU works for inference.
 
-### 🖥️ Command-Line Usage
+> **Note:** no pre-trained checkpoint ships with this repository. Train a model first (below) before running the demo or web app.
 
-For scripting and batch processing:
+## Usage
+
+### 1. Train
+
+The repository bundles a ready-to-use dataset at `datasets/Project_dataset` (`trainA/`, `trainB/`, `testA/`, `testB/`, `style/`):
+
+```bash
+python train.py \
+  --dataroot ./datasets/Project_dataset \
+  --name adain_cyclegan \
+  --use_adain \
+  --batch_size 4 \
+  --n_epochs 100 --n_epochs_decay 100
+```
+
+Monitor with TensorBoard (losses `G_A`, `G_B`, `cycle_A/B`, `idt_A/B`, `style`, `D_A/B` plus image grids):
+
+```bash
+tensorboard --logdir ./checkpoints/adain_cyclegan/logs
+```
+
+Checkpoints are written to `./checkpoints/adain_cyclegan/` (`latest_net.pth` + per-epoch snapshots).
+
+### 2. Command-line inference
 
 ```bash
 python demo.py \
-  --content path/to/content/image.jpg \
-  --style path/to/style/image.jpg \
-  --output path/to/output/result.jpg \
+  --content examples/content/seaport.jpg \
+  --style "examples/styles/oil paint.jpg" \
+  --output result.jpg \
+  --model ./checkpoints/adain_cyclegan/latest_net.pth \
   --style_weight 1.0
 ```
 
-**Parameters**:
-- `--content`: Path to content image
-- `--style`: Path to style reference image
-- `--output`: Output image path
-- `--style_weight`: Style influence (0.0-2.0, default: 1.0)
+`--style_weight` (0.0–2.0) is the feature-space α described above.
 
-### 🏋️ Training Your Own Model
+### 3. Web interface
 
-1. **Prepare your dataset** with the following structure:
-   ```
-   datasets/your_dataset/
-   ├── trainA/          # Content domain A training images
-   ├── trainB/          # Content domain B training images
-   ├── testA/           # Content domain A test images
-   ├── testB/           # Content domain B test images
-   └── style/           # Style reference images
-   ```
+```bash
+# optional — defaults to ./checkpoints/adain_cyclegan/latest_net.pth
+export CHECKPOINT_PATH=./checkpoints/adain_cyclegan/latest_net.pth
+python app.py
+```
 
-2. **Start training**:
-   ```bash
-   python train.py \
-     --dataroot ./datasets/your_dataset \
-     --name my_experiment \
-     --batch_size 4 \
-     --n_epochs 100 \
-     --n_epochs_decay 100
-   ```
+Open `http://localhost:5000`, upload (or webcam-capture) a content image, upload a style image, set the style-weight slider, and generate. The app fails fast with a clear error if the checkpoint is missing — there is intentionally no fallback model.
 
-3. **Monitor training with TensorBoard**:
-   ```bash
-   tensorboard --logdir ./checkpoints/my_experiment/logs
-   ```
-
-### 📊 Evaluation
-
-Evaluate model performance on test data:
+### 4. Evaluate
 
 ```bash
 python test.py \
-  --dataroot ./datasets/your_dataset \
-  --name my_experiment \
-  --results_dir ./results
+  --dataroot ./datasets/Project_dataset \
+  --name adain_cyclegan \
+  --results_dir ./results \
+  --compute_metrics
 ```
 
-This generates evaluation metrics (PSNR, SSIM, FID).
+Reports PSNR and SSIM on cycle reconstructions, and optionally FID. Caveat: the FID implementation extracts features with LPIPS/AlexNet rather than InceptionV3, so values are only comparable *between checkpoints of this project*, not with published numbers.
 
-## 📋 Training Options
-
-Common hyperparameters:
+## Training Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--batch_size` | 8 | Batch size for training |
-| `--n_epochs` | 100 | Epochs with initial learning rate |
-| `--n_epochs_decay` | 100 | Epochs for learning rate decay |
-| `--lr` | 0.0002 | Initial learning rate |
-| `--lambda_A` | 10.0 | Cycle consistency weight (A→B→A) |
-| `--lambda_B` | 10.0 | Cycle consistency weight (B→A→B) |
-| `--lambda_style` | 1.0 | Style loss weight |
+| `--batch_size` | 8 | Batch size |
+| `--n_epochs` / `--n_epochs_decay` | 100 / 100 | Epochs at initial LR / linear-decay epochs |
+| `--lr` | 0.0002 | Adam learning rate (β₁ = 0.5) |
+| `--lambda_A` / `--lambda_B` | 10.0 | Cycle-consistency weights |
 | `--lambda_identity` | 0.5 | Identity loss weight |
+| `--lambda_style` | 1.0 | Style loss weight |
+| `--n_style_images` | 5 | Style exemplars sampled per iteration |
 
-For complete options, run:
-```bash
-python train.py --help
-```
+Full list: `python train.py --help`.
 
-## 🔬 Technical Approach
+## Documentation
 
-### CycleGAN Architecture
-- Two paired generators for bidirectional translation
-- Two discriminators for adversarial training
-- Cycle consistency loss for content preservation
+The `document/` folder is the canonical documentation set:
 
-### AdaIN Integration
-- **Adaptive Instance Normalization**: Aligns content feature statistics with style statistics
-- **Formula**: `AdaIN(C, S) = σ(S) * (C - μ(C)) / σ(C) + μ(S)`
-  - `C`: Content features
-  - `S`: Style features
-  - Enables arbitrary style transfer without retraining
+- [Research background](document/01_research.md) — CycleGAN, AdaIN, MUNIT, and the design tension this project resolves
+- [Architecture](document/02_architecture.md) — networks, style injection, loss formulation, data flow
+- [Build & repair process](document/03_process.md) — step-by-step engineering log
+- [Fixes & changes](document/04_fixes_and_changes.md) — verification-report findings (F1–F10) mapped to code changes
+- [Evaluation & deployment](document/05_evaluation_and_deployment.md) — training, metrics, and serving guide
+- [CycleGAN paper notes](document/06_cyclegan_notes.md) — working notes on the original paper
 
-### Loss Functions
-1. **Adversarial Loss**: Ensures realistic generated images
-2. **Cycle Consistency Loss**: Maintains content integrity (A→B→A)
-3. **Identity Loss**: Preserves color when input is already in target domain
-4. **Style Loss**: Ensures style fidelity through AdaIN
+## Why Combine CycleGAN and AdaIN?
 
-## 📈 Results & Performance
+- **CycleGAN alone** maps to one fixed target domain with no per-image style control.
+- **AdaIN alone** performs arbitrary style transfer on unpaired data, but has no adversarial or cycle constraints, so outputs can drift from the realism of the target domain.
+- **Combined**: domain-level realism from adversarial + cycle losses, plus exemplar-level style control from AdaIN.
 
-### Improvements over Standard CycleGAN
-- **PSNR**: Higher values indicating better reconstruction quality
-- **SSIM**: Higher structural similarity preservation
-- **FID**: Lower Fréchet Inception Distance indicating better style transfer
+Honest caveat: for pure arbitrary style transfer with no domain prior, AdaIN alone is simpler and sufficient. This hybrid is justified when you want both a domain prior and exemplar control — see [document/01_research.md](document/01_research.md).
 
-### Advantages
-- ✅ Works with any style without retraining
-- ✅ Better content preservation
-- ✅ User control over style intensity
-- ✅ Real-time inference capability
+## References
 
-## 🎯 Applications
+1. **CycleGAN** — J. Zhu, T. Park, P. Isola, A. A. Efros. *Unpaired Image-to-Image Translation using Cycle-Consistent Adversarial Networks.* ICCV 2017. [arXiv:1703.10593](https://arxiv.org/abs/1703.10593)
+2. **AdaIN** — X. Huang, S. Belongie. *Arbitrary Style Transfer in Real-time with Adaptive Instance Normalization.* ICCV 2017. [arXiv:1703.06868](https://arxiv.org/abs/1703.06868)
+3. **MUNIT** — X. Huang, M. Liu, S. Belongie, J. Kautz. *Multimodal Unsupervised Image-to-Image Translation.* ECCV 2018. [arXiv:1804.04732](https://arxiv.org/abs/1804.04732)
 
-- **🖼️ Digital Art**: Create artworks in various artistic styles
-- **👗 Fashion Design**: Visualize clothing in different styles
-- **🎬 Entertainment**: Apply visual effects to films and games
-- **🌐 Virtual Reality**: Transform VR environments with custom styles
-- **📷 Photography**: Enhance and stylize photographs with filters
+## License
 
-## 📚 Documentation
-
-For more detailed information, see:
-- [**Project Overview**](docs/overview.md) - High-level introduction
-- [**Architecture**](docs/architecture.md) - System components and data flow
-- [**Technical Details**](docs/technical_details.md) - Implementation specifics
-- [**Workflow**](docs/workflow.md) - Step-by-step processing pipeline
-- [**Usage Guide**](docs/usage_guide.md) - Detailed usage instructions
-- [**CycleGAN Technical Paper Notes**](CycleGan.md) - Research background
-
-## 🔗 References
-
-1. **CycleGAN**: J. Zhu, T. Park, P. Isola, and A. A. Efros. "Unpaired Image-to-Image Translation using Cycle-Consistent Adversarial Networks." ICCV 2017. [arXiv:1703.10593](https://arxiv.org/abs/1703.10593)
-
-2. **AdaIN**: X. Huang and S. Belongie. "Arbitrary Style Transfer in Real-time with Adaptive Instance Normalization." ICCV 2017. [arXiv:1703.06868](https://arxiv.org/abs/1703.06868)
-
-3. **MUNIT**: H. Lee, H. Tseng, J. Huang, M. Singh, and M. Yang. "Diverse Image-to-Image Translation via Disentangled Representations." ECCV 2021.
-
-## 🛠️ System Requirements
-
-| Component | Requirement |
-|-----------|-------------|
-| **Python** | 3.8 or higher |
-| **GPU** | CUDA-compatible (recommended) |
-| **GPU Memory** | 4GB+ for training, 2GB+ for inference |
-| **RAM** | 8GB minimum recommended |
-| **Storage** | 500MB+ for models and datasets |
-
-## 📝 License
-
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to:
-- Report bugs and issues
-- Suggest improvements
-- Submit pull requests with enhancements
-- Improve documentation
-
-## 📧 Support
-
-For issues, questions, or suggestions, please open an [Issue](https://github.com/rajeshkadiyalaaa/Adaptive-Style-Transfer-in-CycleGAN-with-AdaIN-Integration/issues) on GitHub.
-
----
-
-## 🎓 Key Concepts
-
-### What is CycleGAN?
-CycleGAN performs **unpaired image-to-image translation** between two domains without requiring paired examples, using cycle consistency loss to preserve content.
-
-### What is AdaIN?
-Adaptive Instance Normalization (**AdaIN**) aligns the mean and variance of content features with those of style features, enabling **arbitrary style transfer**.
-
-### Why Combine Them?
-- **CycleGAN** alone is limited to fixed domain pairs
-- **AdaIN alone** requires paired training data
-- **Combined**: Flexible, unpaired style transfer with arbitrary styles
-
----
-
-**Made with ❤️ for the computer vision community**
+MIT — see [LICENSE](LICENSE).

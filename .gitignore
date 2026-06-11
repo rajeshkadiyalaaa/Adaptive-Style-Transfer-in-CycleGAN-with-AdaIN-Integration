@@ -22,8 +22,12 @@ var/
 
 # Virtual Environment
 venv/
+.venv*/
 ENV/
 env/
+
+# Generated results
+results/
 
 # Model Checkpoints (comment these out if you want to include them)
 checkpoints/

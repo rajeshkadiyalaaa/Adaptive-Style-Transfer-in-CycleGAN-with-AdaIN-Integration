@@ -123,6 +123,9 @@ def main():
                 }
                 if hasattr(model, 'loss_style') and model.loss_style != 0:
                     losses['style'] = model.loss_style.item()
+                if hasattr(model, 'loss_idt_A') and model.loss_idt_A != 0:
+                    losses['idt_A'] = model.loss_idt_A.item()
+                    losses['idt_B'] = model.loss_idt_B.item()
                 
                 # Print current losses
                 t_data = iter_start_time - iter_data_time

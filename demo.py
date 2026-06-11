@@ -80,7 +80,7 @@ def tensor_to_image(tensor):
     return Image.fromarray(image)
 
 
-def style_transfer(content_path, style_path, output_path, model_path, device='cpu'):
+def style_transfer(content_path, style_path, output_path, model_path, device='cpu', style_weight=1.0):
     """Perform style transfer with AdaIN-CycleGAN.
     
     Args:
@@ -89,6 +89,7 @@ def style_transfer(content_path, style_path, output_path, model_path, device='cp
         output_path (str): Path to save the result image
         model_path (str): Path to the model checkpoint
         device (str): Device to use ('cpu' or 'cuda')
+        style_weight (float): Feature-space style interpolation weight
     """
     # Create options object
     class Opt:
@@ -137,7 +138,7 @@ def style_transfer(content_path, style_path, output_path, model_path, device='cp
     
     # Perform style transfer
     with torch.no_grad():
-        output = model.netG_A(content_img, style_features)
+        output = model.netG_A(content_img, style_features, alpha=style_weight)
     
     # Save the result
     result_img = tensor_to_image(output)
@@ -174,6 +175,7 @@ def main():
     parser.add_argument('--output', type=str, default='output.jpg', help='path to save the result')
     parser.add_argument('--model', type=str, default='./checkpoints/adain_cyclegan/latest_net.pth', help='path to model checkpoint')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'], help='device to use')
+    parser.add_argument('--style_weight', type=float, default=1.0, help='style influence in feature space (0.0-2.0)')
     
     args = parser.parse_args()
     
@@ -190,7 +192,7 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     
     # Perform style transfer
-    style_transfer(args.content, args.style, args.output, args.model, args.device)
+    style_transfer(args.content, args.style, args.output, args.model, args.device, args.style_weight)
 
 
 if __name__ == '__main__':

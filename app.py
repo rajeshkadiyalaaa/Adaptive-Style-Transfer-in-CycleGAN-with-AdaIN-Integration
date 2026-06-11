@@ -3,76 +3,92 @@ import base64
 import re
 from io import BytesIO
 
-import numpy as np
-import tensorflow as tf
-import tensorflow_hub as hub
+import torch
 from flask import Flask, jsonify, render_template, request
 from PIL import Image
+from torchvision import transforms
+
+from models.adain import StyleEncoder
+from models.adain_cycle_gan import AdaINGenerator
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
-# Load the TF-Hub style transfer model
-model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
-style_transfer_model = tf.saved_model.load(model_path)
+# Path to the trained AdaIN-CycleGAN checkpoint (netG_A weights)
+CHECKPOINT_PATH = os.environ.get(
+    'CHECKPOINT_PATH',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 'checkpoints', 'adain_cyclegan', 'latest_net.pth')
+)
 
-def preprocess_image(img_data, target_size):
-    """Preprocesses images for the style transfer model."""
-    if isinstance(img_data, (str, bytes)):  # If base64 or bytes data
-        img = Image.open(BytesIO(img_data)).convert('RGB')
-    else:  # If already a PIL Image
-        img = img_data
-    img = img.resize(target_size)  # Resize image to the target size
-    img = np.array(img) / 255.0  # Normalize to [0, 1]
-    img = tf.convert_to_tensor(img, dtype=tf.float32)
-    img = tf.expand_dims(img, axis=0)  # Add batch dimension
-    return img
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+if not os.path.exists(CHECKPOINT_PATH):
+    raise FileNotFoundError(
+        f'Trained checkpoint not found at {CHECKPOINT_PATH}. '
+        f'Train the model with train.py or set the CHECKPOINT_PATH environment '
+        f'variable to a valid checkpoint.'
+    )
+
+generator = AdaINGenerator(input_nc=3, output_nc=3, ngf=64, use_adain=True).to(device)
+checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+generator.load_state_dict(checkpoint['netG_A'])
+generator.eval()
+
+style_encoder = StyleEncoder().to(device)
+style_encoder.eval()
+
+transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
+
+
+def preprocess_image(img_bytes):
+    """Decode image bytes into a normalized tensor of shape (1, 3, 256, 256)."""
+    img = Image.open(BytesIO(img_bytes)).convert('RGB')
+    return transform(img).unsqueeze(0).to(device)
+
 
 def deprocess_image(tensor):
-    """Deprocess tensor to bytes."""
-    tensor = tf.squeeze(tensor, axis=0)  # Remove batch dimension
-    tensor = tf.clip_by_value(tensor, 0.0, 1.0)  # Ensure values are in [0, 1]
-    tensor = (tensor * 255).numpy().astype(np.uint8)  # Scale to [0, 255]
-    img = Image.fromarray(tensor)
+    """Convert a generator output tensor in [-1, 1] to a base64 PNG string."""
+    tensor = tensor.squeeze(0).detach().cpu()
+    tensor = ((tensor + 1) / 2.0).clamp(0, 1)
+    array = (tensor.permute(1, 2, 0).numpy() * 255).astype('uint8')
+    img = Image.fromarray(array)
     img_byte_arr = BytesIO()
     img.save(img_byte_arr, format='PNG')
-    img_byte_arr = img_byte_arr.getvalue()
-    return base64.b64encode(img_byte_arr).decode('utf-8')
+    return base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
-def style_transfer(content_img_data, style_img_data, style_weight=1.0):
-    """Applies style transfer using the pre-trained TF-Hub model."""
-    # Load and preprocess the content and style images
-    content_image = preprocess_image(content_img_data, (384, 384))
-    style_image = preprocess_image(style_img_data, (256, 256))
 
-    # Use average pooling to smooth style image
-    style_image = tf.nn.avg_pool(style_image, ksize=[3, 3], strides=[1, 1], padding='SAME')
+def style_transfer(content_img_bytes, style_img_bytes, style_weight=1.0):
+    """Apply style transfer with the trained AdaIN-CycleGAN generator.
 
-    # Perform style transfer
-    outputs = style_transfer_model(content_image, style_image)
-    stylized_image = outputs[0]
+    The style weight is applied in feature space inside the AdaIN layers
+    (interpolation between content and style statistics), not as a pixel-space
+    blend of the output images.
+    """
+    content_image = preprocess_image(content_img_bytes)
+    style_image = preprocess_image(style_img_bytes)
 
-    # Apply style weight
-    if style_weight != 1.0:
-        # Interpolate between content and stylized image based on style_weight
-        stylized_image = tf.add(
-            tf.multiply(content_image, (1 - style_weight)),
-            tf.multiply(stylized_image, style_weight)
-        )
-        # Ensure the values are in valid range
-        stylized_image = tf.clip_by_value(stylized_image, 0.0, 1.0)
+    with torch.no_grad():
+        style_features = style_encoder(style_image)
+        output = generator(content_image, style_features, alpha=style_weight)
 
-    return deprocess_image(stylized_image)
+    return deprocess_image(output)
+
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
+
 @app.route('/generate', methods=['POST'])
 def generate_image():
     try:
         style_weight = float(request.form.get('styleWeight', 1.0))
-        
+
         # Handle content image (file upload or webcam)
         if 'contentImage' in request.files and request.files['contentImage'].filename != '':
             content_image = request.files['contentImage'].read()
@@ -93,12 +109,13 @@ def generate_image():
 
         # Generate styled image
         result_image = style_transfer(content_image, style_image, style_weight)
-        
+
         return jsonify({'image_data': f'data:image/png;base64,{result_image}'})
-    
+
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=False)
